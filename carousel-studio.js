@@ -1567,6 +1567,8 @@
   function renderedRichTextLines(element, canvasRect, scale = 1) {
     if (!element) return [];
     const wordsByLine = [];
+    const backgroundGroups = new WeakMap();
+    let nextBackgroundGroup = 1;
     const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
     let node;
     while ((node = walker.nextNode())) {
@@ -1579,10 +1581,15 @@
         if (!rect) continue;
         let parent = node.parentElement;
         let background = "";
+        let backgroundNode = null;
         let bold = false;
         while (parent && parent !== element) {
           const parentStyle = getComputedStyle(parent);
-          background ||= visibleBackground(parentStyle.backgroundColor);
+          const parentBackground = visibleBackground(parentStyle.backgroundColor);
+          if (!background && parentBackground) {
+            background = parentBackground;
+            backgroundNode = parent;
+          }
           bold ||= ["B", "STRONG"].includes(parent.tagName) || Number.parseInt(parentStyle.fontWeight, 10) >= 700;
           parent = parent.parentElement;
         }
@@ -1597,6 +1604,11 @@
           line = { top, words: [] };
           wordsByLine.push(line);
         }
+        let backgroundGroup = null;
+        if (backgroundNode) {
+          if (!backgroundGroups.has(backgroundNode)) backgroundGroups.set(backgroundNode, nextBackgroundGroup++);
+          backgroundGroup = backgroundGroups.get(backgroundNode);
+        }
         line.words.push({
           left: (rect.left - canvasRect.left) * scale,
           top,
@@ -1606,6 +1618,7 @@
           bold,
           color: wordStyle.color,
           background,
+          backgroundGroup,
         });
       }
     }
@@ -1778,6 +1791,7 @@
           bold: !!word.bold,
           color: word.color || "",
           background: word.background || "",
+          backgroundGroup: word.backgroundGroup,
         });
         line.width += width;
       });
@@ -1796,11 +1810,18 @@
         if (!Number.isFinite(segment.left)) cursor += segment.width;
         return placed;
       });
+      const highlightGroups = new Map();
       placements.forEach(({ segment, left }) => {
-        if (segment.background) {
-          context.fillStyle = segment.background;
-          context.fillRect(left - 5, baseline - size * .92, segment.width + 10, size * 1.16);
-        }
+        if (!segment.background) return;
+        const key = segment.backgroundGroup ?? Symbol();
+        const current = highlightGroups.get(key) || { left, right: left + segment.width, color: segment.background };
+        current.left = Math.min(current.left, left);
+        current.right = Math.max(current.right, left + segment.width);
+        highlightGroups.set(key, current);
+      });
+      highlightGroups.forEach((highlight) => {
+        context.fillStyle = highlight.color;
+        context.fillRect(highlight.left - 5, baseline - size * .92, highlight.right - highlight.left + 10, size * 1.16);
       });
       placements.forEach(({ segment, left }) => {
         context.font = `${segment.bold ? 800 : weight} ${size}px ${family}`;
@@ -1939,36 +1960,12 @@
   }
 
   async function makeSlideCanvas(slide, index, suppliedMedia = null) {
-    if (suppliedMedia || !window.domtoimage?.toCanvas) throw new Error("preview capture unavailable");
-    let element = slide === coverSlide() ? ui.coverCanvas : index === series.activeSlide && slide === activeSlide() ? ui.activeCanvas : null;
-    let temporary = false;
-    if (!element?.isConnected || !element.getBoundingClientRect().width) {
-      temporary = true;
-      element = document.createElement("div");
-      element.style.cssText = `position:fixed;left:-10000px;top:0;width:${series.format === "story" ? 360 : 520}px;max-width:none;pointer-events:none`;
-      document.body.append(element);
-      renderCanvas(element, slide, index);
-    }
-    try {
-      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-      const rect = element.getBoundingClientRect();
-      const format = currentFormat();
-      const captured = await window.domtoimage.toCanvas(element, {
-        width: rect.width,
-        height: rect.height,
-        scale: format.width / rect.width,
-        pixelRatio: 1,
-        style: { margin: "0", boxShadow: "none" },
-      });
-      if (captured.width === format.width && captured.height === format.height) return captured;
-      const canvas = document.createElement("canvas");
-      canvas.width = format.width;
-      canvas.height = format.height;
-      canvas.getContext("2d").drawImage(captured, 0, 0, format.width, format.height);
-      return canvas;
-    } finally {
-      if (temporary) element.remove();
-    }
+    const canvas = document.createElement("canvas");
+    canvas.width = currentFormat().width;
+    canvas.height = currentFormat().height;
+    const previewLayout = await measureSlidePreview(slide, index);
+    await drawSlideCanvas(canvas, slide, index, suppliedMedia, previewLayout);
+    return canvas;
   }
 
   function createVideoRecorder(stream) {
